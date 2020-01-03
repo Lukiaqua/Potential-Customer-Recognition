@@ -1,0 +1,613 @@
+---
+title: "Project_trytry"
+author: "Qi Lu"
+date: "2019/4/21"
+output: html_document
+---
+
+```{r}
+rm(list=ls()) #Remove variables from the environment
+#to lode R packages
+library(openxlsx)
+library(plyr)
+library(dplyr)
+library(rpart)
+library(corrplot)
+library(xgboost)
+library(randomForest)
+library(ggplot2)
+#read the xlsx's as dataframes into R
+dtrain=read_excel("/Users/lukiaqua/Desktop/Predictive Analysis/GroupProject/training.candidate.xlsx",na = "NA")
+dtest=read_excel("/Users/lukiaqua/Desktop/Predictive Analysis/GroupProject/testing.candidate.xlsx",na = "NA")
+#to see data size and structure
+str(dtrain)
+summary(dtrain)
+dim(dtrain)
+dim(dtest)
+#remove id
+dtrain=subset(dtrain,select = -id)
+dtest=subset(dtest,select = -id)
+
+dtrain$profit[is.na(dtrain$profit)]=0
+dtest$responded=NA
+dtest$profit=NA
+#combined training data and testing data
+total=rbind(dtrain,dtest)
+#the size and structure of data
+dim(total)
+str(total)
+head(total)
+summary(total)
+# to see which variables contain missing values.
+colSums(is.na(total))[which(colSums(is.na(total))>0)]
+
+#--------------------------------------------------------------
+###Imputing missing data
+#--------------------------------------------------------------
+
+#firstly,fixed the NA's of 'custAge'
+#'custAge' is relate to 'profession',so use the 'profession' to 
+#'group the data and select the median age of group to fill NAs
+
+res=total[!is.na(total$custAge),] %>% group_by(profession) %>% summarise(custAge = median(custAge))
+
+agena=left_join(total[is.na(total$custAge),],res, by ="profession" )
+agena$custAge.x=agena$custAge.y
+agena=subset(agena,select=-custAge.y)
+names(agena)[1]=c('custAge')
+head(agena)
+total=rbind(agena,total[!is.na(total$custAge),])
+
+#next,fixed the NA's of 'schooling','schooling' is relate to 'profession',
+#so use the 'profession' to 'group the data and select the most frequently 
+#schooling of group to fill NAs
+
+#find the mode of schooling in each group of professions
+res2=total[!is.na(total$schooling),] %>% group_by(profession,schooling) %>% summarise(count=n())
+res3=res2 %>% group_by(profession) %>% arrange(desc(count), .by_group = TRUE)
+res3=aggregate(x=res3['count'],by=list(res3$profession),FUN=max)
+names(res3)[1]=c('profession')
+
+#The function of "replace" is to repalce values between the two tables.
+replace<-function(df1,df2,keys,vals){
+  row1<-which(apply(mapply(match,df1[keys],df2[keys])>0,1,all))
+  row2<-which(apply(mapply(match,df2[keys],df1[keys])>0,1,all))
+  df1[row1,vals]=df2[row2,vals]
+  return (df1)
+}
+#t contains the correspondence between "profession" and the mode of "schooling".
+t=replace(res3,res2[!is.na(res2$schooling),],c('profession','count'),c('schooling')) %>% subset(select=-count)
+head(t)
+
+#using left_join to fill NA in "schooling"
+schoolingna=left_join(total[is.na(total$schooling),],t, by ="profession" )
+schoolingna$schooling.x=schoolingna$schooling.y
+schoolingna=subset(schoolingna,select=-schooling.y)
+#rename the name of "schooling" in result
+names(schoolingna)[4]=c('schooling')
+#combind the result
+total=rbind(total[!is.na(total$schooling),],schoolingna)
+
+
+```
+
+```{r}
+#index character variables
+names(total[,sapply(total, is.character)])
+
+#find the mode of profession is 'admin.',so use 'admin' to fill 'unknown'
+
+ggplot(data=total, aes(x=as.factor(profession))) +
+  geom_histogram(stat='count')
+total$profession[which(total$profession=='unknown')]='admin.'
+#then transform 'profession' into one-hot code
+total$profession=as.integer(revalue(total$profession,
+                                    c('admin.'=0,'blue-collar'=1,
+                                      'entrepreneur'=2,"housemaid"=3,
+                                      "management"=4,"retired"=5,
+                                      "self-employed"=6,"services"=7,
+                                      "student"=8,"technician"=9,
+                                      "unemployed"=10)))
+table(total$profession)
+
+ggplot(data=total, aes(x=as.factor(month))) +
+  geom_histogram(stat='count')
+#transform 'month' into one-hot code
+total$month=ifelse(
+  total$month %in% c("jan","feb","mar"),1,
+  ifelse(
+    total$month %in% c("apr","may","jun"),2,
+    ifelse(
+      total$month %in% c("jul","aug","sep"),3,
+      ifelse(
+        total$month %in% c("oct","nov","dec"),4,0
+      )
+    )
+  )
+)
+table(total$month)
+
+#transform 'schooling' into one-hot code
+#Because 'schooling' has so many categories,So merge "basic.4y","basic.6y","basic.9y" into a group
+ggplot(data=total, aes(x=as.factor(schooling))) +
+  geom_histogram(stat='count')
+total$schooling=ifelse(
+  total$schooling %in% c("basic.4y","basic.6y","basic.9y"),1,
+  ifelse(
+    total$schooling=="high.school",2,
+    ifelse(
+      total$schooling=="illiterate",3,
+      ifelse(
+        total$schooling=="university.degree",4,0
+      )
+    )
+  )
+)
+table(total$schooling)
+
+
+#find the mode of marital is 'married',so use 'married' to fill 'unknown'
+ggplot(data=total, aes(x=as.factor(marital))) +
+  geom_histogram(stat='count')
+total$marital[which(total$marital=='unknown')]='married'
+total$marital=as.integer(revalue(total$marital,c("divorced"=2,"married"=1,"single"=0)))
+table(total$marital)
+
+
+#find the mode of default is 'no',so use 'no' to fill 'unknown'
+ggplot(data=total, aes(x=as.factor(default))) +
+  geom_histogram(stat='count')
+total$default[which(total$default=='unknown')]='no'
+total$default=as.integer(revalue(total$default,c('yes'=1,'no'=0)))
+table(total$default)
+
+#find the mode of loan is 'yes',so use 'yes' to fill 'unknown'
+ggplot(data=total, aes(x=as.factor(loan))) +
+  geom_histogram(stat='count')
+total$loan[which(total$loan=='unknown')]='yes'
+total$loan=as.integer(revalue(total$loan,c('yes'=1,'no'=0)))
+table(total$loan)
+
+#find the mode of day_of_week is 'thu',so use 'thu' to fill 'unknown'
+ggplot(data=total, aes(x=as.factor(day_of_week))) +
+  geom_histogram(stat='count')
+total$day_of_week[is.na(total$day_of_week)]='thu'
+total$day_of_week=as.integer(revalue(total$day_of_week, c('mon'=1, 'tue'=2,"wed"=3,"thu"=4,"fri"=5)))
+table(total$day_of_week)
+
+#find the mode of default is 'cellular',so use 'cellular' to fill 'unknown'
+ggplot(data=total, aes(x=as.factor(contact))) +
+  geom_histogram(stat='count')
+total$contact[which(total$contact=='unknown')]='cellular'
+total$contact=as.integer(revalue(total$contact,c('cellular'=1,'telephone'=0)))
+table(total$contact)
+
+#find the mode of default is 'nonexistent',so use 'no' to fill 'unknown'
+ggplot(data=total, aes(x=as.factor(poutcome))) +
+  geom_histogram(stat='count')
+total$poutcome[which(total$poutcome=='unknown')]='nonexistent'
+total$poutcome<-as.integer(revalue(total$poutcome, c('failure'=0, 'nonexistent'=1, 'success'=2)))
+table(total$poutcome)
+
+#find the mode of housing is 'yes',so use 'yes' to fill 'unknown'
+ggplot(data=total, aes(x=as.factor(housing))) +
+  geom_histogram(stat='count')
+total$housing[which(total$housing=='unknown')]="yes"
+total$housing=as.integer(revalue(total$housing,c('yes'=1,'no'=0)))
+table(total$housing)
+
+#convert responded into one-hot code :1 means yes ,0 means no
+total$responded=as.integer(revalue(total$responded, c('yes'=1, 'no'=0)))
+table(total$responded)
+
+#Use the log function to convert "cons.price.idx" and "nr.employed"
+total$cons.price.idx=log(total$cons.price.idx)
+total$nr.employed=log(total$nr.employed)
+#Divide age into three segments,Representing youth, middle age, old
+total$custAge=cut(total$custAge,breaks=c(0,30,50,100),labels=c("youth","middle aged","old"))
+total$custAge=as.integer(total$custAge,c("youth"=0,"middle aged"=1,"old"=2))
+
+
+train=total[!is.na(total$responded),]
+## Determine the predictor names
+predictors= c('euribor3m','euribor3m','loan','nr.employed','cons.price.idx','cons.conf.idx')
+```
+```{r}
+#--------------------------------------------------------------
+###analyzing the relationship between variables 
+#--------------------------------------------------------------
+#to find variable correlations with cor
+train=total[!is.na(total$responded),]
+#cordata=subset(train,select =-c(profit))
+#correlations of all variables
+cordata <- cor(train) 
+corrplot(corr = cordata, tl.col="black", tl.pos = "lt", tl.cex = 0.7,cl.cex = .7, number.cex=.7)
+
+#to find variable importance with RandomForest
+set.seed(2019)
+RF <- randomForest(x=train[1:8238,-c(22,23)], y=train$profit, ntree=100,importance=TRUE)
+impRF <- importance(RF)
+impDF <- data.frame(Variables = row.names(impRF), MSE = impRF[,1])
+impDF <- impDF[order(impDF$MSE, decreasing = TRUE),]
+ggplot(impDF[1:15,], aes(x=reorder(Variables, MSE), y=MSE, fill=MSE)) + geom_bar(stat = 'identity') + labs(x = 'Variables', y= '% increase MSE if variable is randomly permuted') + coord_flip() + theme(legend.position="none")
+
+#The conclusion is 'euribor3m','loan','nr.employed','cons.price.idx',
+#'cons.conf,idx' has most importance on responded
+#
+```
+
+```{r}
+#--------------------------------------------------------------
+###modeling and predicting 'responded' and 'profit'
+#--------------------------------------------------------------
+#Split the data set into training and testing 
+library(caret)
+train=total[!is.na(total$responded),]
+test=total[is.na(total$responded),]
+
+set.seed(156)
+split1 <- createDataPartition(train$responded, p = .7)[[1]]
+testing     <- train[-split1,]
+training  <- train[ split1,]
+
+```
+
+```{r}
+#Using XGBOOST in Up Original training data set to predict RESPONDE
+dparams=list(objective = "binary:logistic",
+             max_depth = 4, 
+             eta = 0.1,
+             colsample_bytree=1,
+             min_child_weight=1,
+             subsample=1,
+             eval_metric ="error")
+#training$responded=as.numeric(training$responded)
+#training$responded = training[,'responded'] -1
+orgdata=xgb.DMatrix(data=as.matrix(training[,-c(22,23)]),label = training$responded)
+testdata=xgb.DMatrix(data = as.matrix(testing[,-c(22,23)]),label= testing$responded)
+
+orgxgb <- xgb.train(data = orgdata, 
+               label = training[,'responded'], 
+               nrounds =12,
+               params=dparams
+)
+#Predict whether customers will respond
+org_probs = predict(orgxgb,testdata)
+#probability greater than 0.5 is divided into 1,others is divided into 0
+org_pred=ifelse(org_probs>0.5,1,0)
+
+table(org_pred, testing$responded)
+mean(org_pred!=testing$responded)
+
+cv.res <- xgb.cv(data = orgdata, label = training$responded,nround = 1, params=dparams, nfold = 10)
+cv.res
+```
+
+
+```{r}
+#Using logistic regression in original training data set
+#All factors
+glm.fit_train  = glm(responded ~ ., data = training,family="binomial")
+glm.probs_train = predict(glm.fit_train,testing,type="response")
+glm.pred_train=ifelse(glm.probs_train>0.5,1,0)
+table(glm.pred_train, testing$responded)
+mean(glm.pred_train!=testing$responded)
+```
+[1] 0.0222582
+
+```{r}
+#Using logistic regression in original training data set
+#use more important factors: #'euribor3m','loan','nr.employed','cons.price.idx','cons.conf.idx'
+glm.fit_train2  = glm(responded ~ euribor3m+loan+nr.employed+cons.price.idx+cons.conf.idx, data = training,family="binomial")
+glm.probs_train2 = predict(glm.fit_train2,testing,type="response")
+glm.pred_train2=ifelse(glm.probs_train2>0.5,1,0)
+table(glm.pred_train2, testing$responded)
+mean(glm.pred_train2!=testing$responded)
+```
+[1] 0.1116957
+
+```{r}
+#Using logistic regression CV in original training data set
+library(boot)
+training1=training[,-c(5,23)]
+set.seed(17)
+cv.error.org=rep(0,10)
+for (i in 1:10){
+  glm.fit.cv  = glm(responded ~ ., data = training1,family="binomial")
+  cv.error.org[i]=cv.glm(training1,glm.fit.cv,K=10)$delta[1]
+}
+cv.error.org
+min(cv.error.org)
+```
+0.07858433
+```{r}
+#Using LDA in ORIGINAL training data set
+library(MASS)
+set.seed(17)
+lda.fit.org  = lda(responded ~., data = training1,family="binomial")
+lda.pred.org = predict(lda.fit.org,testing)
+lda.class.org=lda.pred.org$class
+
+table(lda.class.org, testing$responded)
+mean(lda.class.org!=testing$responded)
+```
+lda.class.org    0    1
+            0 2126  183
+            1   74   88
+[1] 0.1040065
+
+Overall, we find that using glm and all factors to predict will have a better result in terms of error rate.
+
+```{r}
+#Using LDA in ORIGINAL training data set
+#'euribor3m','loan','nr.employed','cons.price.idx','cons.conf.idx'
+lda.fit.org1  = lda(responded ~ euribor3m+loan+nr.employed+cons.price.idx+cons.conf.idx, data = training1,family="binomial")
+lda.pred.org1 = predict(lda.fit.org1,testing)
+lda.class.org1=lda.pred.org1$class
+
+table(lda.class.org1, testing$responded)
+mean(lda.class.org1!=testing$responded)
+```
+
+```{r}
+#------------------------------------------------------------------
+### Fix Class Imbalance Problem
+#------------------------------------------------------------------
+#Class imbalance problem
+dim(training)
+table(training$responded)
+```
+
+In classification problems, a disparity in the frequencies of the observed classes can have a significant negative impact on model fitting. One technique for resolving such a class imbalance is to subsample the training data in a manner that mitigates the issues.
+
+up-sampling: randomly sample (with replacement) the minority class to be the same size as the majority class. caret contains a function (upSample) to do this.
+Source: https://topepo.github.io/caret/subsampling-for-class-imbalances.html
+
+
+```{r} 
+#UpSampling
+training$responded = as.factor(training$responded)
+library(caret)
+set.seed(1)
+upSampledTrain <- upSample(x = training,
+                           y = training$responded,
+                           yname = "respond")
+#upSampledTrain=select(upSampledTrain,-respond)
+
+dim(upSampledTrain)
+table(upSampledTrain$responded)
+class(upSampledTrain$responded)
+```
+
+```{r}
+#Using XGBOOST in Up Sampling training data set to predict RESPONDE
+dparams=list(objective = "binary:logistic",
+             max_depth = 4, 
+             eta = 0.1,
+             colsample_bytree=1,
+             min_child_weight=1,
+             subsample=1,
+             eval_metric ="error")
+upSampledTrain$responded=as.numeric(upSampledTrain$responded)
+upSampledTrain$responded = upSampledTrain[,'responded'] -1
+updata=xgb.DMatrix(data=as.matrix(upSampledTrain[,-c(22,23,24)]),label = upSampledTrain$responded)
+testdata=xgb.DMatrix(data = as.matrix(testing[,-c(22,23)]),label= testing$responded)
+
+upxgb <- xgb.train(data = updata, 
+               label = upSampledTrain[,'responded'], 
+               nrounds =12,
+               params=dparams
+)
+#Predict whether customers will respond
+up_probs = predict(upxgb,testdata)
+#probability greater than 0.5 is divided into 1,others is divided into 0
+up_pred=ifelse(up_probs>0.5,1,0)
+
+table(up_pred, testing$responded)
+mean(up_pred!=testing$responded)
+
+cv.res <- xgb.cv(data = updata, label = upSampledTrain$responded,nround = 1, params=dparams, nfold = 10)
+cv.res
+```
+[1] 0.1995144
+CV- 0.2488584
+
+```{r}
+#Using logistic regression in predicting RESPONDE
+#use more important factors: #'euribor3m','loan','nr.employed','cons.price.idx','cons.conf.idx'
+glm.fit  = glm(responded ~ euribor3m+loan+nr.employed+cons.price.idx+cons.conf.idx, data = upSampledTrain,family="binomial")
+glm.probs = predict(glm.fit,testing,type="response")
+glm.pred=ifelse(glm.probs>0.5,1,0)
+
+table(glm.pred, testing$responded)
+mean(glm.pred!=testing$responded)
+```
+[1] 0.2877378
+```{r}
+#Using logistic regression in Up Sampling training data set
+upsample = upSampledTrain[,-(24)]
+glm.fit  = glm(responded ~ ., data = upsample,family="binomial")
+glm.probs = predict(glm.fit,testing,type="response")
+glm.pred=ifelse(glm.probs>0.5,1,0)
+table(glm.pred, testing$responded)
+mean(glm.pred!=testing$responded)
+```
+[1] 0.2254148
+
+```{r}
+#Using logistic regression CV in Up Sampling training data set
+library(boot)
+set.seed(17)
+cv.error.10=rep(0,10)
+for (i in 1:10){
+  glm.fit  = glm(responded ~ ., data = upsample,family="binomial")
+  cv.error.10[i]=cv.glm(upsample,glm.fit,K=10)$delta[1]
+}
+cv.error.10
+min(cv.error.10)
+```
+[1] 0.1793875
+ 
+```{r}
+#Using logistic regression in Up Sampling training data set
+library(MASS)
+upsample=upsample[,-5]
+set.seed(17)
+lda.fit  = lda(responded ~., data = upsample,family="binomial")
+lda.pred = predict(lda.fit,testing)
+lda.class=lda.pred$class
+
+table(lda.class, testing$responded)
+mean(lda.class!=testing$responded)
+```
+[1] 0.2290571
+```{r}
+#'euribor3m','loan','nr.employed','cons.price.idx','cons.conf.idx'
+lda.fit1  = lda(responded ~ euribor3m+nr.employed+cons.price.idx+cons.conf.idx, data = upsample,family="binomial")
+lda.pred1 = predict(lda.fit1,testing)
+lda.class1=lda.pred1$class
+
+table(lda.class1, testing$responded)
+mean(lda.class1!=testing$responded)
+```
+
+```{r}
+#------------------------------------------------------------------
+###use training data and glm to predict "responded"
+#------------------------------------------------------------------
+glm.fit_test  = glm(responded ~ ., data = training1,family="binomial")
+glm.probs_test = predict(glm.fit_test,test,type="response")
+glm.pred_test=ifelse(glm.probs_test>0.5,1,0)
+test$responded=glm.pred_test
+```
+
+```{r}
+#------------------------------------------------------------------
+###use training data to build classification model on "PROFIT"
+#------------------------------------------------------------------
+#predict 'profit' using linear model in xgboost
+dparams=list(objective = "reg:linear",
+             max_depth = 5, 
+             eta = 1.4,
+             colsample_bytree=1,
+             min_child_weight=2,
+             subsample=1,
+             eval_metric='rmse')
+dt.profit=xgb.DMatrix(data=as.matrix(training[which(training$responded==1),-c(22,23)]),label = training$profit[which(training$responded==1)])
+
+xgb.profit <- xgb.train(data = dt.profit, 
+               params =dparams,
+               nrounds =125
+)
+org_probs = predict(orgxgb,testdata)
+xgb.val.profit = predict(xgb.profit,xgb.DMatrix(data=as.matrix(testing[which(testing$responded==1),-c(22,23)])))
+testing_profit=round(xgb.val.profit)
+
+#calculate rmse
+sqrt(mean((testing$profit - xgb.val.profit)^2))
+RMSE(xgb.val.profit, testing$profit)
+
+#calculate rmse after cross validation
+cv.res <- xgb.cv(data = orgdata, label = training$profit,nround = 1, params=dparams, nfold = 10)
+cv.res
+```
+212.7209
+
+```{r}
+#predict 'profit' using linear model 'lm.fit'
+orgprofit= training[which(training$responded == 1),] 
+orgprofit = orgprofit[,-22]
+lm.fit.org=lm(profit~.,data=orgprofit)
+summary(lm.fit.org)
+```
+
+```{r}
+lm.fit.org1=lm(profit~euribor3m+nr.employed+cons.price.idx+cons.conf.idx,orgprofit)
+summary(lm.fit.org)
+```
+
+```{r}
+#calculate rmse from lm.fit
+mse <- mean(residuals(lm.fit.org1)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+rse <- sqrt(sum(residuals(lm.fit.org1)^2) / lm.fit.org1$df.residual ) 
+rse
+```
+84.59152
+
+```{r}
+#------------------------------------------------------------------
+###use Up Sampling data to build classification model on "profit"
+#------------------------------------------------------------------
+#predict 'profit' using linear model in xgboost
+dparams=list(objective = "reg:linear",
+             max_depth = 5, 
+             eta = 1.4,
+             colsample_bytree=1,
+             min_child_weight=2,
+             subsample=1,
+             eval_metric='rmse')
+#upSampledTrain$responded=as.numeric(upSampledTrain$responded)
+#upSampledTrain$responded = upSampledTrain[,'responded'] -1
+dt.profit=xgb.DMatrix(data=as.matrix(upSampledTrain[which(upSampledTrain$responded==1),-c(22,23,24)]),label = upSampledTrain$profit[which(upSampledTrain$responded==1)])
+
+xgb.profit <- xgb.train(data = dt.profit, 
+               params =dparams,
+               nrounds =125
+)
+up_probs = predict(upxgb,testdata)
+xgb.val.profit = predict(xgb.profit,xgb.DMatrix(data=as.matrix(testing[which(testing$responded==1),-c(22,23)])))
+testing_profit=round(xgb.val.profit)
+
+#calculate rmse
+sqrt(mean((testing$profit - xgb.val.profit)^2))
+RMSE(xgb.val.profit, testing$profit)
+
+#calculate rmse after cross validation
+cv.res <- xgb.cv(data = updata, label = upSampledTrain$profit,nround = 1, params=dparams, nfold = 10)
+cv.res
+```
+
+```{r}
+#predicting profit 
+xgb.val.profit = predict(xgb.profit,xgb.DMatrix(data=as.matrix(testing[which(testing$responded==1),-c(22,23)])))
+#Rounding prediction
+testing$profit[which(testing$responded==1)]=round(xgb.val.profit)
+
+```
+
+```{r}
+#predict 'profit' using linear model 'lm.fit'
+upprofit= upSampledTrain[which(upSampledTrain$responded == 1),] 
+upprofit = upprofit[,-c(22,24)]
+lm.fit=lm(profit~.,data=upprofit)
+summary(lm.fit)
+```
+
+```{r}
+lm.fit1=lm(profit~euribor3m+nr.employed+cons.price.idx+cons.conf.idx,upprofit)
+summary(lm.fit1)
+```
+
+
+```{r}
+#calculate rmse from lm.fit
+mse <- mean(residuals(lm.fit1)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+rse <- sqrt( sum(residuals(lm.fit1)^2) / lm.fit1$df.residual ) 
+rse
+```
+
+```{r}
+#predict 'profit' using linear model 'lm.fit.org'
+testprofit= test[which(test$responded == 1),] 
+#lm.fit_test=lm(testprofit$profit~.,data=testprofit[,22])
+lm.pred.org=predict(lm.fit.org,testprofit,type="response")
+test$profit[which(test$responded==1)]=round(lm.pred.org)
+summary(test$profit)
+#write.csv(test,file = "testing_final.csv",row.names = F)
+```
